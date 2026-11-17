@@ -1,6 +1,6 @@
 # LLM Radar
 
-Python 抓取任务以 Docker 运行在 NAS，本地 SQLite 保存主数据；Cloudflare D1、KV 和 TypeScript Worker 提供只读查询，React 展示模型与价格历史。默认美元展示，支持人民币。
+Python 抓取任务以 Docker 运行在 NAS，本地 SQLite 保存主数据；Cloudflare D1 和 KV 保存公开数据副本，TypeScript Worker 提供只读 API 与受 Access 保护的快照发布入口，React 展示模型与价格历史。默认美元展示，支持人民币。
 
 架构、数据模型、同步发布协议、容器运行和实施顺序见 [plan.md](plan.md)。目前处于方案阶段，尚未实现抓取器、镜像或网站。
 

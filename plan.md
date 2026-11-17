@@ -98,6 +98,7 @@ llm-radar/
 6. 金额统一为“每百万 token 的原币金额 × 1,000,000”的整数。例如每百万 token 2.5 USD 存 2500000。Python 用 Decimal 从原始十进制字符串转换，禁止先转 float；超出精度或整数范围时拒绝静默舍入。
 7. JSON 中金额用十进制整数字符串，避免 JS 整数精度丢失。格式化、换算和显示舍入不参与调价判定。
 8. 业务时间由 NAS 生成 UTC ISO 8601 毫秒值，远端原样保存；NAS 调度按北京时间，汇率日期按 UTC。
+9. 一个发布批次只使用一个版本序号：`sync_batches.seq = price_history.batch_seq = releases.seq`，且 `sync_batches.id = releases.id`。序号只增不复用；`releases.parent_seq` 指向前一个完整发布版本。
 
 ## 四、公共数据模型
 
@@ -206,7 +207,7 @@ CREATE TABLE model_sources (
   first_seen_at TEXT NOT NULL,
   last_seen_at TEXT NOT NULL,
   miss_count INTEGER NOT NULL DEFAULT 0 CHECK(miss_count >= 0),
-  context_length INTEGER,
+  context_length INTEGER, -- 来源报告的模型上下文能力，不是 offers 的价格档位范围
   updated_at TEXT NOT NULL,
   PRIMARY KEY(model_id, source_id),
   UNIQUE(source_id, source_key)
@@ -319,12 +320,13 @@ Content-Type: application/json
 }
 ```
 
-- /query 支持单条 sql/params 和参数化 batch；不另造 /batch 路径。表名来自程序白名单，值参数化，不拼配置到 SQL。
+- /query 支持单条 sql/params 和参数化 batch；不另造 /batch 路径。表名来自程序白名单，值参数化，不拼配置到 SQL。D1 官方 [Query API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/) 支持 batch 请求体，但没有承诺其与 Worker 绑定 [`DB.batch()`](https://developers.cloudflare.com/d1/worker-api/d1-database/) 具有相同的整批事务回滚语义。
+- Cloudflare 将内置 D1 REST API 定位为管理用途，因为它受 Cloudflare API 全局限流（见 [外部应用访问 D1](https://developers.cloudflare.com/d1/tutorials/build-an-api-to-access-d1/)）。本方案只在低频 NAS 同步前提下使用；请求数纳入预算，429 遵守 Retry-After 并退避。若调用量增长，改由受鉴权 Worker 作为外部接入层。
 - 外键上传顺序：sources、models、offers、fx_rates、price_history，最后 releases。实体 ID 和 created_at/updated_at 原样传，不用远端 now 重写。
 - 可变 sources / models 携带 revision_seq，只有更高版本能更新；同版本须核对内容相同，低版本不得覆盖。这样即使超时旧请求迟到，也不会把副本元信息改回旧值。provider/canonical_name 作为身份不原地改写，别名显示变更与身份迁移分开处理。
 - 不可变记录重推时核对内容，一致才成功；同 ID 不同内容或自然键撞另一个 ID 必须 blocked。禁止无目标 INSERT OR IGNORE 掩盖错配。
 - 检查 HTTP、顶层 success、每条 result.success 及错误数组；HTTP 200 不等于全部成功。超时后可能已提交，用相同 ID、参数、时间和 hash 重推并核验。
-- 每分块初始最多 50 条，另满足单 SQL 字节、绑定参数、请求大小限制。跨请求没有事务，不能把分块成功当作整轮原子完成。单请求失败语义纳入 D1 集成测试。
+- 每分块初始最多 50 条，另满足单 SQL 字节、绑定参数、请求大小限制。跨请求没有事务，且不依赖 REST batch 整批回滚；逐条检查结果，任何失败都不推进该分块检查点，重放整块冻结 payload。单请求部分失败和超时已提交语义纳入 D1 集成测试。
 
 ### 8.2 持久化队列与重试
 
@@ -472,7 +474,24 @@ services:
 - 所有 Worker 可达域名都保护管理入口；关闭不用的 workers.dev/preview 入口，部署验收匿名调用必须被拒绝。公开响应只包含契约字段。
 - NAS 只出站，不映射容器端口；401/403 立即告警，不无限重试。
 - 等待数据库/KV/网络不算 Worker CPU；Worker 内解析、转换、校验、序列化消耗 CPU。保留 KV 是缓存和完整版本发布决策，不能声称任何 D1 读取都会耗尽 CPU。参见 [Workers Limits](https://developers.cloudflare.com/workers/platform/limits/)。
-- 预算覆盖普通 API 和快照 JSON/hash 校验，测试最大目录的 CPU/内存/延迟。Free 超限先缩减目录/分页再评估套餐，不保证永远免费。
+- 以下是 **2026-11-17** 的 Free 额度预算基线；每次上线前重新核对官方限制：
+
+| 资源 | Free 基线 | 本项目的预算规则 |
+|------|-----------|------------------|
+| Workers 请求 | 100,000 次/天 | 预估公开流量，达到额度 70% 告警 |
+| Worker CPU | 10 ms/请求 | 用最大目录压测快照校验、解析和序列化 |
+| Worker 子请求 | 50 次/请求 | 按 API 路由核算 D1/KV 调用数 |
+| D1 行读取 | 5,000,000 行/天 | 纳入历史查询、快照发布和重试 |
+| D1 行写入 | 100,000 行/天 | 纳入业务表、索引、迁移和重试 |
+| D1 存储 | 500 MB/库；5 GB/账号 | 价格事件保留量按实际增长率估算 |
+| D1 查询结果 | 50 MB/次 | 历史分页；完整目录限制 1 MiB |
+| KV 读取 | 100,000 次/天 | 与 Workers 请求预算分别核算 |
+| KV 写入不同 key | 1,000 次/天 | 版本目录写入次数计入日预算 |
+| KV 同 key 写入 | 1 次/秒 | 发布入口串行化重复写入 |
+| KV 单值 | 25 MiB | 目录上限 1 MiB，为 KV 留足空间 |
+
+- D1 与 KV 的行读写/操作指标按账号共享额度；按 D1 `meta.rows_read` / `meta.rows_written` 和 KV 实际操作量估算日用量。以 `预估峰值请求量 × 每请求 p95 用量 + 同步/快照开销` 做容量核算，任一资源达到 70% 告警；投影超出额度时先缩小查询/缓存压力或评估套餐，不承诺免费额度永久够用。
+- 预算覆盖普通 API 和快照 JSON/hash 校验，测试最大目录的 CPU、内存和延迟。
 - 同时监控 Workers 请求/CPU、D1 每日读写行数/存储、KV 操作量/值大小，索引和重试也有成本。上线复核 [D1 Limits](https://developers.cloudflare.com/d1/platform/limits/)、[D1 Pricing](https://developers.cloudflare.com/d1/platform/pricing/) 与 Workers/KV 官方限制。
 - D1 HTTP 参数及结果以 [Query API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/) 为准，不将 Worker 调用额度套给 NAS HTTP 上传。
 - 结构化日志含 run_id、source_id、batch_seq、耗时和各阶段结果；告警覆盖任务未启动、源连续失败、条目异常下降、旧汇率、outbox 积压、版本未更新、磁盘不足、备份失败。
