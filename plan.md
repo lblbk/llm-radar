@@ -1,6 +1,6 @@
 # llm-radar 实施方案 v2
 
-NAS 上的 Docker 容器持续运行 Python 服务，由容器内调度器定时抓取；本地 SQLite 保存主数据。抓取结果同步到 Cloudflare D1，Worker 提供公开 API，React 展示站点读取公开数据。后续可在 NAS 服务中增加本地配置界面。镜像由 GitHub Actions 发布到 GHCR，NAS 部署固定版本。
+NAS 上的 Docker 容器持续运行 Python 服务，由容器内调度器定时抓取；本地 SQLite 保存主数据。先交付 `llm-radar`，再交付 NAS 局域网配置界面 `admin-web`。公开查询与展示随后由 Cloudflare Worker、D1 和 React 站点承担。镜像由 GitHub Actions 发布到 GHCR，NAS 部署固定版本。模块边界见 [项目架构](docs/architecture.md)，接口和里程碑见 [开发手册](docs/development.md)。
 
 ## 一、架构与职责
 
@@ -14,7 +14,7 @@ NAS（Docker 常驻服务）
   → 后续增加本地配置 API / Web 界面
 
 浏览器 → Workers Assets：公开 React 页面
-       → Worker API → D1：当前报价和历史记录
+       → Worker API → D1：报价、价格历史、评测结果及其出处
 
 SQLite + 本地来源配置 + 待同步队列 → 定期备份到 NAS 的备份位置
 ```
@@ -25,7 +25,7 @@ SQLite + 本地来源配置 + 待同步队列 → 定期备份到 NAS 的备份�
 | NAS / Python | 常驻服务、定时抓取、SQLite 主库、待同步重试；后续提供本地配置界面 |
 | Worker / TypeScript | 公开查询 API 和静态资源路由 |
 | D1 | 网站使用的公开数据副本和价格历史 |
-| React | 公开模型列表、来源选择、币种切换和历史曲线 |
+| React | 公开报价与历史、来源标注、按标准和版本查看模型能力评测 |
 
 - CF 不抓取、不调度业务任务、不编辑源配置，不保存源站认证信息。
 - NAS 是配置与运行状态的主库；D1 只保存网站需要的公开数据。
@@ -41,7 +41,8 @@ Python 服务是独立的 `llm-radar` Python distribution，导入包名为 `llm
 llm-radar/
 ├── README.md
 ├── .gitignore
-├── .env.example                   # 本地/Compose 环境变量样例，不含密钥
+├── .env.example                   # Compose 镜像、宿主机路径和 UID/GID
+├── runtime.env.example            # 应用运行参数与凭据名，值留空
 ├── .dockerignore                  # 根目录是 Docker build context
 ├── compose.yaml                   # 部署编排，显式指向 apps/llm-radar/Dockerfile
 ├── .github/workflows/
@@ -111,17 +112,33 @@ llm-radar/
 1. 创建 `crawl_runs`，按来源配置读取 `sources.enabled`、`priority` 和对应的 `source_configs`。配置中的 `parser` 选择已注册的来源适配器；适配器定义请求构造方式、分页策略及响应解析规则，URL、非敏感参数和密钥引用保存在 NAS 本地。
 2. Fetcher 通过 httpx 发出请求，按适配器的分页规则逐页抓取并记录页序。优先使用公开 JSON/API；没有稳定 API 时再解析 HTML。首版串行执行，同域请求间隔、超时、重试和响应大小遵循第十节限制。确实依赖 JavaScript 的来源才使用可选浏览器镜像。
 3. 每页响应按运行、来源、尝试和页序压缩写入 `/data/raw/`，同时生成 manifest，记录状态码、内容类型、抓取时间、hash、页序和适配器版本。先完整写临时文件再原子落盘；密钥与认证 headers 不进入 manifest、日志或远端数据。
-4. 收齐页面后调用纯函数 `parse(raw_pages, params) -> ParseResult`。Parser 不联网、不访问数据库，将来源字段转换为统一记录，并返回模型、报价、覆盖范围、分页完整性、错误和警告。金额从原始十进制文本用 Decimal 解析，再按公共模型规定的单位转换；不先转 float。
-5. Store 校验整个来源结果：必需字段有效、source_key 和报价档位无冲突、币种/单位受支持、页面完整且覆盖声明成立。`source_runs` 记录每个来源的 `success`、`empty`、`incomplete` 或 `error` 结果；只有通过校验的来源数据才参与本轮业务更新。失败或不完整的来源保留旧数据并标记 stale，不能增加模型缺失计数。空目录单独记为 `empty`，不据此确认下架。
-6. 网络请求和解析均在 SQLite 写事务外完成。通过校验后，Store 在单一本地事务内应用来源结果、生成价格历史，并把待上传的公开记录放入同步队列；事务规则见第五节。raw 文件供解析回放和故障定位使用，不上传 Cloudflare。
+4. 收齐页面后调用纯函数 `parse(raw_pages, params) -> ParseResult`。按来源用途输出 `price` 报价或 `evaluation` 评测记录，同时返回覆盖范围、分页完整性、错误和警告。Parser 不联网、不访问数据库。金额和分数从原始十进制文本解析。
+5. `source_runs` 按来源记录 `success`、`empty`、`incomplete` 或 `error`。先验证完整性，再按用途校验报价档位和单位，或校验评测指标和条件。模型版本或指标映射不明确的评测行在 NAS 待核对，记录原标签、出处和原值，管理员确认后再发布。空目录及抓取失败的处理见第六节。
+6. Store 在本地事务内保存通过校验的记录、价格变化或评测修订，并把公开变更放入同步队列。raw 仅在 NAS 供回放和排错。
 
 新增来源时，先确定公开 source 元数据、URL、适配器和覆盖范围；若现有适配器不能表达其请求或响应格式，再新增来源解析器。提交脱敏后的真实响应 fixture，覆盖分页结束、空结果、字段缺失和价格单位，并用 fixture 验证解析与完整性判断。实际首批来源及其 endpoint/字段映射尚未在本方案中列出，开始实现前需要确定并写入 `apps/llm-radar/config/default-sources.json`。
+
+### 来源如何登记和使用
+
+一条 `sources` 记录对应一个可以单独启停和校验的采集入口。同一网站的定价页和排行榜各建一条记录，可共用发布方和适配器。管理员登记发布方、用途、来源类别、适用范围、公开出处和用途内优先级。价格入口限定所报告的厂商；一个评测入口可覆盖多个厂商、多个标准。来源类别按入口及其覆盖对象认定：厂商对自家模型的声明才标为官方，评测标准作者对其他厂商模型的独立测评可标为第三方机构。
+
+新增入口默认停用。预览时，价格来源需给出与官方服务对应的计价依据；评测来源需给出原报告、方法和版本。管理员核对后启用，单独批准第三方价格回退。机构身份本身不授予回退资格。日后可撤销授权或停用入口，下一次同步后网站重新选价；无需删除历史来纠正来源选择。
+
+| 用途 | 可登记的来源 | 网站如何使用 |
+|------|--------------|--------------|
+| 厂商公开报价 | 厂商官方、经管理员核准可转述该厂商定价的第三方 | 同模型版本、币种、模式和档位优先显示官方价。第三方必须引用相同厂商服务和计价条件；平台自己的零售价、促销和不同区域价格不能补入该档。 |
+| 能力评测 | 厂商自测、第三方机构、第三方个人 | 逐条标注发布方、实际评测方、标准版本、指标、条件和原始出处。相同标准的多个独立结果并列，允许按来源类别筛选。转载引用原测评，不能计作另一次独立测量。 |
+
+**价格回退。** 每个价格入口配置有效期，建议每日抓取的入口初始设为 72 小时。按整档选择：官方抓取暂时失败时，在有效期内保留最后一次官方价并标注核实时间；官方从未取得或已过期时，才选启用、核准且仍有效的第三方，明确显示“第三方参考价”、出处和回退原因。同级按配置优先级、最近核实时间、稳定 ID 决定。没有合格候选就显示“暂无当前报价”，旧价仍可查历史。官方恢复后自动切回；切换展示来源不生成调价事件，不拼接不同来源的价格字段。已确认下架的厂商报价档停止回退。
+
+**纳入新标准。** 例如，新榜单在已有表格接口中增加“代码修复 v2 / 通过率”。管理员登记标准版本、指标单位和方向，映射榜单列、模型版本和测试条件，用一份样本预览结果，核对原文后启用。v1 的成绩仍按 v1 查询。复用现有适配器时只改配置；遇到新的分页方式、页面结构或计分语义才增加适配器和 fixture。首次通过 CLI 导入和预览，后续局域网 Web 界面复用同一套操作。启停、调整等级和回退授权在 NAS 记录变更时间、原因及前后值；停用停止采集和默认选用，历史保留出处。
 
 ## 三、身份、金额与定价维度
 
 1. 源、模型、报价、价格事件和运行 ID 均由 NAS 生成 UUID 的 32 位小写十六进制字符串，两边原样保存。D1 不自行分配实体 ID。
 2. 模型公开 URL 使用 models.id，不把含斜杠的厂商名称当路径参数。原始名称保留大小写；canonical_name 由厂商适配器确定，不能统一 lowercase 后猜测别名。
 3. provider 使用固定厂商标识，展示名另存。跨源别名通过显式映射归并，没有把握的不自动合并。
+   有明确版本的模型以版本化 `canonical_name` 登记；滚动别名可单独承载价格。榜单只写系列名时，保留原文并等待确认具体版本，避免把旧版本的分数挂到当前模型。
 4. 一个报价序列由模型、来源、模式（standard / batch）、上下文下限/上限、原币种唯一确定。上下文采用 `[min, max)`，max=0 表示无上限；重叠或不支持的档位拒绝入库。
 5. 输入、输出、缓存读取、缓存写入分别存金额；缺失为 NULL，免费为 0。音频、图片、按请求收费等不强行换算 token，第一版标为不支持并告警。
 6. 金额统一为“每百万 token 的原币金额 × 1,000,000”的整数。例如每百万 token 2.5 USD 存 2500000。Python 用 Decimal 从原始十进制字符串转换，禁止先转 float；超出精度或整数范围时拒绝静默舍入。
@@ -137,11 +154,19 @@ llm-radar/
 CREATE TABLE sources (
   id TEXT PRIMARY KEY NOT NULL,
   name TEXT NOT NULL UNIQUE,
-  public_url TEXT,
+  publisher TEXT NOT NULL,
+  public_url TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('price','evaluation')),
+  source_class TEXT NOT NULL CHECK(source_class IN ('official','organization','individual')),
+  provider_scope TEXT,
+  fallback_approved INTEGER NOT NULL DEFAULT 0 CHECK(fallback_approved IN (0,1)),
+  valid_hours INTEGER,
   priority INTEGER NOT NULL DEFAULT 100,
   enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  CHECK(kind <> 'price' OR (provider_scope IS NOT NULL AND valid_hours IS NOT NULL AND valid_hours > 0)),
+  CHECK(fallback_approved = 0 OR (kind = 'price' AND source_class = 'organization'))
 );
 
 CREATE TABLE models (
@@ -187,6 +212,7 @@ CREATE TABLE price_history (
   cached_input_price INTEGER CHECK(cached_input_price >= 0),
   cache_write_price INTEGER CHECK(cache_write_price >= 0),
   fx_rate_id TEXT REFERENCES fx_rates(id),
+  evidence_url TEXT NOT NULL,
   captured_at TEXT NOT NULL,
   CHECK(input_price IS NOT NULL OR output_price IS NOT NULL
      OR cached_input_price IS NOT NULL OR cache_write_price IS NOT NULL)
@@ -194,6 +220,15 @@ CREATE TABLE price_history (
 CREATE INDEX idx_price_history
   ON price_history(offer_id, captured_at, id);
 ```
+
+能力评测增加两张公共表，与价格表共用模型和来源 ID。每个标准可登记多个指标，新增标准或版本就是新增定义行。
+
+| 表 | 字段和约束 |
+|----|------------|
+| `benchmark_metrics` | `id`、稳定标准标识、名称、版本、指标、单位、优劣方向、方法说明 URL，可选上下界。标准标识 + 版本 + 指标唯一。单位、方法或计分口径改变时新建版本。 |
+| `evaluation_results` | `id`、`model_id`（指向确定的模型版本）、`source_id`、`metric_id`、原报告结果键、实际评测方、原始报告 URL、测试条件、十进制分数字符串、测评日期（可未知）、抓取时间和修订号。来源 + 原结果键 + 修订号唯一。原结果键标识报告中的模型、指标和测试设置，缺少源站 ID 时由适配器从这些稳定字段生成。重复抓到同一内容复用原记录，原报告改分追加修订。 |
+
+测试条件按指标配置校验，保留原报告给出的数据集划分、样本范围、提示方式、工具和推理设置。只有模型版本明确、标准版本、指标及可比条件一致时才开放横向比较；条件缺失的结果仍可展示并注明“条件未披露”。个人测试、官方自报和机构评测均保留署名，首版不计算跨标准总分。发布方或评测时间未知时如实标注，不用采集时间代填。公开出处使用可公开访问的报告或定价页地址，剔除私有请求参数。
 
 - sources 只含公开元信息。抓取 URL、headers、参数、secret 引用放 NAS 专用配置表；认证参数、错误堆栈、原始响应不上传。
 - offers 定价维度不变；换币种/档位创建新报价序列。当前价格取该报价最新的价格历史记录；网站展示 active 报价，并标注 stale 报价。
@@ -252,7 +287,7 @@ CREATE TABLE source_runs (
 );
 
 CREATE TABLE sync_outbox (
-  id TEXT PRIMARY KEY NOT NULL,
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
   entity TEXT NOT NULL,
   entity_id TEXT NOT NULL,
   payload_json TEXT NOT NULL CHECK(json_valid(payload_json)),
@@ -263,10 +298,12 @@ CREATE TABLE sync_outbox (
 );
 ```
 
+来源和标准的声明式映射保存在 `source_configs.params_json`。本地另存来源配置变更记录、待核对的评测行，以及单行 `sync_state`（目标库 ID、最后确认的序号与时间）。服务记录北京时间的调度日期，按日期对定时任务去重；手动运行单独记录。
+
 1. 网络抓取、分页和校验在事务外完成，raw 先完整落盘，不在网络等待期间持有写事务。
 2. 一个本地事务内应用已通过校验的来源数据、记录价格变化，并写入待同步队列；事务失败时一起回滚，避免本地数据已变而同步队列遗漏。
 3. 同一个来源的多页结果先合并后保存。价格未变只更新最后观测时间；某来源失败时保留旧价格，只更新运行状态和 stale 标记，并将状态变化排入同步队列；其他成功来源照常入库。
-4. 上传成功后删除对应队列项；失败时保留原 payload 和 ID，下一次自动重试。
+4. 收到远端确认后，在同一本地事务内推进 `sync_state` 并删除已确认的连续队列项。超时保留原 payload、实体 ID 和顺序。
 5. 全部启用来源成功为 success，部分成功为 partial，全部失败为 failed；运行结果保存在 `crawl_runs` 和 `source_runs`。
 
 ## 六、采集结果完整性
@@ -275,8 +312,8 @@ CREATE TABLE sync_outbox (
 
 - 每个来源说明自己能否覆盖完整模型/报价列表。只有请求、分页和字段校验都成功，才算一次完整抓取。
 - 来源失败或只抓到部分页面时，保留旧数据并标记 stale；不能因本次没看到某个模型就把它删除。
-- 完整列表连续三次都没有某模型时，标记为“可能已下架”；第一版不自动永久删除，需管理员确认。
-- 不同来源和不同价格档位分别保存。默认展示优先级最高且数据最新的有效来源，历史按具体报价查看。
+- 完整列表连续三次都没有某模型时，标记该来源“可能已下架”。管理员确认后将该来源受影响的报价标记为 `unavailable_confirmed`；只有确认厂商官方停供才停止相应厂商档位的价格回退。
+- 缺失判定只应用于声明覆盖完整目录的价格来源。评测榜单撤榜、改版或抓取失败只影响该入口，不改变模型供应状态。默认报价按第二节回退规则选择，历史按具体来源和报价查看。
 
 ## 七、币种换算
 
@@ -289,10 +326,10 @@ CREATE TABLE sync_outbox (
 
 同步的作用是把 NAS SQLite 中的公开数据送到 D1，供 Cloudflare Worker 和网页读取。它不是备份。
 
-1. 每次来源结果通过校验并写入 SQLite 时，同一事务把需要公开的变更放进 `sync_outbox`。
-2. 常驻服务随后把队列记录按来源、模型、报价、价格历史的顺序写入 D1。使用参数化 SQL、稳定 ID 和幂等 upsert；确认 D1 接收成功后才移除队列记录，网络失败时保留并自动重试。
-3. Cloudflare Worker 直接查询 D1 当前数据。同步过程中页面可能短暂读到部分更新；首版接受这一点，若实际需要整轮原子切换再单独设计。
-4. D1 仅含公开数据。源站密钥、来源私有配置、运行日志和 raw 文件仍保存在 NAS。
+1. 抓取、配置启停、回退授权和评测定义变更都在更新 SQLite 的同一事务中按外键依赖入队：来源、模型、汇率和指标定义在前，报价与评测结果在后，价格历史在报价及汇率之后。NAS 是唯一写入方，按公共字段白名单通过 D1 HTTP API 发送参数化 SQL。
+2. 单个发送任务按 `seq` 顺序处理。启动即检查积压，有新记录时唤醒；网络错误和限流独立于每日抓取退避重试。逐条确认 API 及 SQL 结果成功再推进，不越过失败项；权限、数据或迁移错误暂停发送并在 `status` 显示原因。超时重发时，可变记录按主键更新，不可变历史按原 ID 去重。Worker 直接读取已到达的变更，一轮抓取可分批可见。
+3. 首次部署或云库丢失时，管理员执行 `sync rebuild`，显式指定**新的空 D1**。暂停常规发送，取得一致的 SQLite 快照及同一时点的队列高水位。按依赖导入所有公共行，再按主键排序，逐表比对行数与规范化公开字段的摘要。切换前短暂停止本地业务写入，重放快照之后的增量并再次核对；成功后切换 Worker binding 和 NAS 目标库、记录确认位置并恢复任务。切换完成前保留原库与队列，失败可重新开始。
+4. 从较旧 NAS 备份恢复时以恢复模式启动，先暂停采集与发送，保全当前 D1。将云端独有的价格历史和评测修订连同依赖记录导出，与本地按稳定 ID 核对；管理员确认合并结果后，从修复后的 SQLite 重建公开副本。直接重播旧队列可能回写过期状态。私有配置、运行记录、密钥和 raw 只能从各自的本地留存恢复。
 
 ## 九、公开 API 与前端
 
@@ -300,6 +337,7 @@ CREATE TABLE sync_outbox (
 |------|------|
 | GET /api/models?currency=USD\|CNY | 从 D1 读取当前报价，可选币种 |
 | GET /api/models/:id/history?offer_id=...&currency=USD\|CNY | 读取指定报价历史，可附日期范围、limit、cursor |
+| GET /api/models/:id/evaluations | 返回该模型各标准、版本、指标、原分、单位、条件、评测方、来源类别、原文及日期。支持按指标和来源筛选，默认返回每个原结果的最新修订。 |
 | GET /healthz | 返回 Worker 存活状态 |
 
 响应示例，金额使用十进制整数字符串：
@@ -315,6 +353,10 @@ CREATE TABLE sync_outbox (
     "offers": [{
       "id": "1123456789abcdef0123456789abcdef",
       "source_id": "2123456789abcdef0123456789abcdef",
+      "source_label": "示例厂商官方定价",
+      "evidence_url": "https://example.org/pricing",
+      "selection": "official",
+      "fallback_reason": null,
       "mode": "standard",
       "context_min": 0,
       "context_max": 0,
@@ -333,6 +375,7 @@ CREATE TABLE sync_outbox (
 ```
 
 - 非法 ID、币种和范围返回 400；模型或报价不存在返回 404；D1 不可用返回 503。
+- 每个默认报价附 `selection`（`official` 或 `third_party_reference`）、来源名称、出处、最近核实时间；回退时附原因。报价和评测详情都可直接回到原文。
 - Worker 只公开 `/api/*` 和静态资源；来源配置入口留在 NAS，不暴露到公开站点。
 
 ## 十、Docker、CLI 与调度
@@ -346,20 +389,21 @@ Docker 镜像作为常驻服务运行，Python 调度器每天北京时间 09:00
 | serve | 启动常驻服务和内置调度器 |
 | run-once | 立即抓取一次，之后同步已入库数据 |
 | sync | 重试尚未同步到 D1 的公开数据 |
-| sources import-defaults / import / export | 首次导入镜像内置种子；导入校验合并；导出不含凭据 |
+| sync rebuild | 从本地完整快照构建新的 D1 公开副本，核对和切换步骤见第八节 |
+| sources import-defaults / preview / import / export | 首次导入内置种子；预览样本字段、模型匹配、价格回退资格和评测单位；按稳定 ID 校验合并；导出不含凭据 |
 | sources confirm-unavailable | 管理员确认某模型已停止供应 |
-| status | 查看服务状态、最近抓取时间和待同步数量 |
+| status | 显示最近抓取结果、最近成功同步时间、积压条数、最早待同步时间及阻塞原因 |
 
-- 服务只运行一个实例；抓取、手动操作和未来的配置界面共用同一数据库，并通过进程锁避免同时写入。
+- 服务只运行一个实例；抓取、手动操作和未来的配置界面共用同一数据库，并通过进程锁避免同时写入。调度器、手动 `sync` 和恢复流程共用发送锁，确保任何时刻只有一个任务向 D1 写入。
 - 收到 SIGTERM 时停止接收新任务，等待当前来源在宽限时间内结束；Docker 使用 `restart: unless-stopped`。
-- 服务保存最近一次运行状态和待同步数量，失败的同步在后续调度周期自动重试。
+- 飞牛启动时若已过北京时间 09:00 且当天计划任务尚未完成，补抓一次，记录真实抓取时间。连续停机多天只补当天；中断的运行标记 `abandoned`，重新检查待发送队列。
 - HTTP 默认连接 10 秒、读取 30 秒，另设源总时限。最多三次抓取，同域串行且间隔至少一秒，遵守 Retry-After。重定向最多五次，解压后单响应最多 10 MiB；截断/超限/失败页不得作为定价页。
 - 配置导入按稳定 source_id 合并，未列出的源保留，停用显式 disable。名称冲突、未知 parser、非法 URL/参数使整次导入失败。参数按 parser 自己的 schema 校验，不承诺任意 JSON API 无代码接入。
 - 后续的 `apps/admin-web/` 运行在 NAS 局域网，通过本地 API 修改 SQLite 中的来源和调度配置；首版调度时间固定为每天 09:00，届时可由界面修改。它与 Cloudflare 上的公开 `apps/web/` 分开部署。首版不映射 Web 端口，密钥仍通过 NAS 运行环境管理。
 
 Compose 设计示例（实施时写入仓库根目录 `compose.yaml`）：
 
-NAS 的 .env 中设置 `LLM_RADAR_IMAGE=ghcr.io/lblbk/llm-radar:v0.1.0`（示例版本，须已发布），或使用 Release 输出的完整 digest 引用；其余数据路径和 UID/GID 仍由 NAS 本地填写。
+在飞牛上准备一个 Compose 项目目录，放入 `compose.yaml`、`.env` 和 `runtime.env`。在 `.env` 填写固定镜像 `LLM_RADAR_IMAGE`、宿主机的 `NAS_UID`、`NAS_GID` 和两个实际绝对路径 `NAS_DATA_DIR`、`NAS_BACKUP_DIR`。先在对应存储卷建好两个目录并授予该 UID/GID 写权限，再从飞牛 Docker 平台部署此 Compose 项目。`runtime.env` 放 Cloudflare 账户、目标 D1 标识、令牌及源站凭据，限制为部署账户可读。镜像版本使用已发布的 tag 或 digest。
 
 ```yaml
 services:
@@ -374,10 +418,23 @@ services:
       LLM_RADAR_DATA_DIR: /data
       LLM_RADAR_BACKUP_DIR: /backup
     env_file:
-      - .env
+      - ./runtime.env
     volumes:
-      - ${NAS_DATA_DIR:?set absolute local path}:/data
-      - ${NAS_BACKUP_DIR:?set NAS backup path}:/backup
+      - type: bind
+        source: ${NAS_DATA_DIR:?set absolute local path}
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NAS_BACKUP_DIR:?set NAS backup path}
+        target: /backup
+        bind:
+          create_host_path: false
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
     tmpfs:
       - /tmp
     stop_grace_period: 60s
@@ -387,21 +444,19 @@ services:
 - 镜像 ENTRYPOINT 是已安装 CLI，依赖按锁文件 frozen 安装；.dockerignore 排除数据、raw、密钥和开发环境。
 - /data 挂 NAS 本机文件系统专用目录并赋给指定 UID/GID，SQLite 主库不放 SMB/NFS。参见 [Docker bind mounts](https://docs.docker.com/engine/storage/bind-mounts/)。
 - `/backup` 映射到单独配置的 NAS 备份位置；服务每天将 SQLite 一致性副本写入该目录。
-- `.env` 仅在运行时加载，不写入镜像。源站密钥和 D1 写入令牌不进入日志。
+- `.env` 用于 Compose 插值，仅 `runtime.env` 注入应用。两个文件都排除在版本库和镜像构建上下文之外，仅提交脱敏样例。应用日志写 stdout/stderr，由 Docker 轮转。
 
 ## 十一、原始数据、备份与恢复
 
-```text
-/data/
-├── crawl.db
-├── raw/<run_id>/<source_id>/<attempt>/<page_id>.body.gz
-├── raw/<run_id>/<source_id>/manifest.json
-└── logs/YYYY-MM-DD.jsonl
-```
+| 飞牛宿主机 | 容器内 | 用途 |
+|------------|--------|------|
+| `$NAS_DATA_DIR/crawl.db` 及同目录 SQLite 辅助文件 | `/data/crawl.db` 及同目录辅助文件 | 挂载整个目录；重建容器后继续使用原库 |
+| `$NAS_DATA_DIR/raw/` | `/data/raw/<run_id>/<source_id>/` | `<attempt>/<page_id>.body.gz` 保存原始页，`manifest.json` 记录抓取信息 |
+| `$NAS_BACKUP_DIR/` | `/backup/` | 保存每日一致性 SQLite 副本，优先使用独立存储卷 |
 
 - D1 是网站使用的公开数据副本，不含 NAS 的来源私有配置、运行记录和待同步队列，因此不能代替本地备份。
-- 每天用 SQLite backup API 将 `crawl.db` 备份到 NAS 上单独配置的备份位置，保留最近 7 份。备份内容包含来源配置和待同步队列；`.env` 中的密钥另行安全备份。
-- raw 只用于排查和重放解析，默认保留最近 7 天，不要求放进数据库备份；无法恢复时可重新抓取来源。
+- 每天用 SQLite backup API 将 `crawl.db` 备份到 `/backup`，保留最近 7 份。备份包含来源配置、已入库的评测与价格、运行状态和待同步队列。单独安全保存 `runtime.env` 和部署参数。
+- 每日清理已结束且超过 7 天的运行的 raw。抓取前和分页写入时检查剩余空间，低于配置的预留空间便停止本轮新抓取并报告磁盘不足。raw 到期后仍可查看已入库的原值和出处；源站后续变化时，重新抓取无法重现旧页面。
 - 备份位置应使用不同存储卷；NAS 已有可靠快照备份时，也可使用其备份策略。首次升级前验证能从一份备份恢复 SQLite。
 
 ## 十二、鉴权、额度与监控
@@ -414,11 +469,11 @@ services:
 ## 十三、测试与实施顺序
 
 1. 完成 SQLite/D1 公共表和来源配置结构。
-2. 用 1～2 个真实来源跑通抓取，fixture 覆盖分页、空响应、缺字段和价格单位。
+2. 用一个厂商定价页、一个可信第三方价格入口和一个评测入口跑通全流程。验收官方短暂失败、过期回退、恢复切回且无伪调价；用评测样本覆盖同榜不同条件、转载、改分和只改配置接入新指标。
 3. 验证常驻服务、定时触发、容器重启和手动抓取不会重复写入。
-4. 验证 D1 同步可重试、重复上传不会产生重复历史记录，Worker 能读取当前数据。
-5. 验证 SQLite 备份可恢复，再完成 NAS 实际部署和镜像升级流程。
-6. 后续阶段增加 NAS 局域网配置界面；公开 Cloudflare 页面继续只读。
+4. 优先交付 NAS 局域网管理 API 和 `admin-web`，验收来源预览与启停、回退授权、待核对评测和调度设置。在飞牛用同一挂载目录更换镜像，检查数据库和 raw 仍可读。
+5. 模拟断网一天及远端写入后响应丢失，恢复后按序补齐；从旧备份及云端较新记录演练第八节的恢复，再从本地重建空 D1 并核对。
+6. 最后开发 Cloudflare 上的只读 Worker 和公开 Web，验收价格回退标注、历史与评测出处。
 
 部署时填写 NAS 架构/UID/GID、数据路径、备份位置、Cloudflare D1 信息、D1 写入令牌和告警地址。
 
@@ -454,7 +509,7 @@ services:
 
 - 目标是公共镜像，供 NAS 使用一个 GHCR 引用直接拉取。GHCR 包初次发布默认 private，仓库公开不代表包自动公开；首次发布后在包设置显式改为 Public，并验证匿名拉取。参见 [GitHub Container registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)。
 - 如果以后改为私有包，NAS 另外配置具有 read:packages 权限的 PAT classic 登录；该凭据不是 Actions 的 GITHUB_TOKEN，也不是 D1/Access token。
-- 首次部署下载对应版本的根目录 `compose.yaml` 和 `.env.example`，填写 NAS 数据目录、备份目录、凭据与镜像版本，拉取镜像后导入默认来源并启动常驻服务。无需在 NAS clone 整个仓库或安装构建工具。
+- 首次部署下载对应版本的 `compose.yaml`、`.env.example` 和 `runtime.env.example`，按第十节准备目录和两个环境文件，拉取镜像后导入默认来源并启动常驻服务。无需在 NAS clone 整个仓库或安装构建工具。
 - 升级前确认 SQLite 备份可用；更新 `LLM_RADAR_IMAGE` 后拉取并重建服务。Docker 会先优雅停止旧容器，再启动新版本。
 
 ```sh
